@@ -2,6 +2,7 @@
 
 import socket
 import argparse
+import struct
 
 def run_server(port, output_file):
     # 1. Create a UDP socket
@@ -18,25 +19,83 @@ def run_server(port, output_file):
         while True:
             f = None
             sender_filename = None
-            reception_started = False
+            sender_addr = None
+            expected_seq_num = 0
+            buffer = {}  # Dictionary to store out-of-order packets
+            eof_seq = None
+            
+            print("==== Waiting for file transfer ====")
             while True:
-                data, addr = sock.recvfrom(4096)
-                # Protocol: If we receive an empty packet, it means "End of File"
+                packet, addr = sock.recvfrom(4096)  # 4 bytes header + 4092 data
+                
+                # Extract sequence number and data
+                if len(packet) < 4:
+                    continue
+                
+                seq_num = struct.unpack('!I', packet[:4])[0]
+                data = packet[4:]
+                
+                # Protocol: If we receive an empty packet (data length is 0), it means "End of File"
                 if not data:
-                    print(f"[*] End of file signal received from {addr}. Closing.")
-                    break
+                    eof_seq = seq_num
+                    if eof_seq == expected_seq_num and not buffer:
+                        ack_packet = struct.pack('!I', seq_num)
+                        for _ in range(3):
+                            sock.sendto(ack_packet, addr)
+                        print(f"[*] End of file signal received from {addr} (seq: {seq_num}).")
+                        break
+                    continue
+                
+                # Initialize file on first packet
                 if f is None:
                     print("==== Start of reception ====")
                     ip, sender_port = addr
                     sender_filename = f"received_{ip.replace('.', '_')}_{sender_port}.jpg"
+                    sender_addr = addr
                     f = open(sender_filename, 'wb')
                     print(f"[*] First packet received from {addr}. File opened for writing as '{sender_filename}'.")
-                # Write data to disk
-                f.write(data)
-                # print(f"Server received {len(data)} bytes from {addr}") # Optional: noisy
+                
+                # Reordering logic
+                if seq_num == expected_seq_num:
+                    # This is the packet we needed next! Write it.
+                    f.write(data)
+                    expected_seq_num += 1
+                    # print(f"[*] Wrote packet {seq_num}, expecting next: {expected_seq_num}")
+                    
+                    # VITAL STEP: Check if the next packet is already waiting in buffer
+                    while expected_seq_num in buffer:
+                        buffered_data = buffer.pop(expected_seq_num)
+                        f.write(buffered_data)
+                        # print(f"[*] Wrote buffered packet {expected_seq_num}, expecting next: {expected_seq_num + 1}")
+                        expected_seq_num += 1
+                
+                elif seq_num > expected_seq_num:
+                    # Packet arrived too early (out of order). Store it for later.
+                    buffer[seq_num] = data
+                    # print(f"[*] Out-of-order packet {seq_num} (expected {expected_seq_num}), buffering...")
+                
+                else:
+                    # Packet is old (duplicate). Ignore it.
+                    # print(f"[*] Duplicate packet {seq_num} (expected {expected_seq_num}), ignoring...")
+                    pass
+
+                # Send ACK back (repeat to improve delivery under loss)
+                ack_packet = struct.pack('!I', seq_num)
+                for _ in range(3):
+                    sock.sendto(ack_packet, addr)
+
+                # If EOF already arrived and we've caught up, finalize
+                if eof_seq is not None and eof_seq == expected_seq_num and not buffer:
+                    ack_packet = struct.pack('!I', eof_seq)
+                    for _ in range(3):
+                        sock.sendto(ack_packet, addr)
+                    print(f"[*] End of file signal received from {addr} (seq: {eof_seq}).")
+                    break
+            
             if f:
                 f.close()
             print("==== End of reception ====")
+    
     except KeyboardInterrupt:
         print("\n[!] Server stopped manually.")
     except Exception as e:
